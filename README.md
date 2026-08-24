@@ -51,7 +51,10 @@ runs, pass the previous run's start timestamp as `refresh_since`. This scans
 markets updated or finalized since that run while still filtering the final
 result by the requested occurrence-date window. Any previously unresolved
 market is picked up when a Yes/No result appears, and changed determinations
-replace the earlier row through `merge_market_refresh`.
+replace the earlier row. When an existing `output_csv` is used, the utility
+writes refresh rows to a temporary file and chunk-merges them into the existing
+CSV by ticker. The existing file remains untouched until the refresh succeeds.
+For in-memory results, use `merge_market_refresh` explicitly.
 
 ## Low-memory market pulls
 

@@ -6,9 +6,11 @@ from tempfile import TemporaryDirectory
 import pandas as pd
 
 from kalshi_utils import (
+    MARKET_COLUMNS,
     _SportsSeriesMatcher,
     _ny_day_bounds,
     _parse_datetime,
+    _merge_market_refresh_csv,
     _sports_series_for_market,
     fetch_markets_by_tickers,
     fetch_live_result_candidates,
@@ -134,6 +136,35 @@ class MetadataTests(unittest.TestCase):
         self.assertEqual(len(merged), 1)
         self.assertEqual(merged.iloc[0]["result"], "yes")
 
+    def test_incremental_csv_refresh_preserves_old_rows_and_replaces_tickers(self):
+        with TemporaryDirectory() as temp_dir:
+            existing_path = Path(temp_dir) / "markets.csv"
+            refresh_path = Path(temp_dir) / "refresh.csv"
+            old = pd.DataFrame.from_records(
+                [
+                    {"ticker": "A", "occurrence_date_ny": "2026-05-01", "result": "no"},
+                    {"ticker": "B", "occurrence_date_ny": "2026-05-02", "result": "yes"},
+                ],
+                columns=["occurrence_date_ny", "ticker", "result"],
+            )
+            refresh = pd.DataFrame.from_records(
+                [
+                    {"ticker": "A", "occurrence_date_ny": "2026-05-01", "result": "yes"},
+                    {"ticker": "C", "occurrence_date_ny": "2026-05-03", "result": "no"},
+                ],
+                columns=["occurrence_date_ny", "ticker", "result"],
+            )
+            old.reindex(columns=MARKET_COLUMNS).to_csv(existing_path, index=False)
+            refresh.reindex(columns=MARKET_COLUMNS).to_csv(refresh_path, index=False)
+
+            counts = _merge_market_refresh_csv(existing_path, refresh_path, chunksize=1)
+            merged = pd.read_csv(existing_path)
+
+        self.assertEqual(counts, (1, 2, 3))
+        self.assertEqual(set(merged["ticker"]), {"A", "B", "C"})
+        self.assertEqual(merged.loc[merged["ticker"] == "A", "result"].item(), "yes")
+        self.assertFalse(refresh_path.exists())
+
     def test_load_saved_markets_single_day_and_range(self):
         source = pd.DataFrame(
             [
@@ -244,6 +275,33 @@ class MetadataTests(unittest.TestCase):
             )
             self.assertIsNone(returned)
             self.assertEqual(pd.read_csv(output)["ticker"].tolist(), ["KXSPORT-26MAY01-A"])
+
+            existing = pd.read_csv(output)
+            existing.loc[0, "result"] = "no"
+            retained = existing.iloc[[0]].copy()
+            retained.loc[:, "ticker"] = "KXSPORT-26APR30-RETAINED"
+            existing = pd.concat([existing, retained], ignore_index=True)
+            existing.to_csv(output, index=False)
+
+            pull_sports_markets(
+                "2026-05-01",
+                "2026-05-01",
+                client=FakeClient(),
+                refresh_since="2026-05-01T00:00:00Z",
+                verbose=False,
+                output_csv=output,
+                return_dataframe=False,
+                csv_flush_rows=1,
+            )
+            refreshed = pd.read_csv(output)
+            self.assertEqual(
+                set(refreshed["ticker"]),
+                {"KXSPORT-26MAY01-A", "KXSPORT-26APR30-RETAINED"},
+            )
+            self.assertEqual(
+                refreshed.loc[refreshed["ticker"] == "KXSPORT-26MAY01-A", "result"].item(),
+                "yes",
+            )
 
 
 if __name__ == "__main__":

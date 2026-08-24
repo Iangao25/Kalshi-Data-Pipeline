@@ -1,7 +1,7 @@
-"""Fast public-API utilities for settled Kalshi sports markets and trades.
+"""Fast public-API utilities for resolved Kalshi sports markets and trades.
 
-The functions in this module are deliberately notebook-friendly: they return
-pandas DataFrames and do not read or write local datasets on their own.
+The functions in this module are deliberately notebook-friendly. They return
+pandas DataFrames or optionally stream large market results to CSV.
 """
 
 from __future__ import annotations
@@ -12,8 +12,10 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+import os
 import random
 import re
+import tempfile
 import threading
 import time as time_module
 from typing import Any, Iterable, Iterator, Mapping, Sequence
@@ -597,6 +599,60 @@ def _compact_market_frame(frame: pd.DataFrame) -> pd.DataFrame:
     return frame
 
 
+def _merge_market_refresh_csv(
+    existing_path: Path,
+    refresh_path: Path,
+    *,
+    chunksize: int,
+) -> tuple[int, int, int]:
+    """Chunk-merge a refresh CSV into an existing CSV, preferring refresh rows."""
+
+    refresh_tickers: set[str] = set()
+    refresh_rows = 0
+    for chunk in pd.read_csv(refresh_path, usecols=["ticker"], chunksize=chunksize):
+        tickers = chunk["ticker"].dropna().astype(str)
+        refresh_tickers.update(tickers)
+        refresh_rows += len(chunk)
+
+    descriptor, merged_name = tempfile.mkstemp(
+        prefix=f".{existing_path.stem}-merged-",
+        suffix=".csv",
+        dir=existing_path.parent,
+    )
+    os.close(descriptor)
+    merged_path = Path(merged_name)
+    retained_existing_rows = 0
+    try:
+        pd.DataFrame(columns=MARKET_COLUMNS).to_csv(merged_path, index=False)
+        for chunk in pd.read_csv(existing_path, chunksize=chunksize):
+            if refresh_tickers:
+                chunk = chunk.loc[~chunk["ticker"].astype(str).isin(refresh_tickers)]
+            retained_existing_rows += len(chunk)
+            if not chunk.empty:
+                chunk.reindex(columns=MARKET_COLUMNS).to_csv(
+                    merged_path,
+                    mode="a",
+                    header=False,
+                    index=False,
+                )
+        for chunk in pd.read_csv(refresh_path, chunksize=chunksize):
+            if not chunk.empty:
+                chunk.reindex(columns=MARKET_COLUMNS).to_csv(
+                    merged_path,
+                    mode="a",
+                    header=False,
+                    index=False,
+                )
+        os.replace(merged_path, existing_path)
+    except Exception:
+        merged_path.unlink(missing_ok=True)
+        raise
+    finally:
+        refresh_path.unlink(missing_ok=True)
+
+    return retained_existing_rows, refresh_rows, retained_existing_rows + refresh_rows
+
+
 def pull_sports_markets(
     start_date: str | date | datetime,
     end_date: str | date | datetime | None = None,
@@ -626,8 +682,11 @@ def pull_sports_markets(
     while the final inclusion window still uses occurrence time. Record the
     previous run's start time and pass it on the next run; markets that were
     unresolved then are picked up when a Yes/No result appears.
-    This function returns only the newly found resolved markets in that mode;
-    combine them with prior results using :func:`merge_market_refresh`.
+    This function returns only the newly found resolved markets in that mode.
+    When ``output_csv`` already exists, the incremental rows are automatically
+    merged into it by ticker, preferring the refreshed row. In-memory callers
+    can combine the returned rows with prior results using
+    :func:`merge_market_refresh`.
 
     ``settled_since`` is retained as a backward-compatible alias for
     ``refresh_since``.
@@ -636,7 +695,8 @@ def pull_sports_markets(
     the raw live/archive universes are never retained. Nested combo-leg payloads
     are omitted by default because they can dominate memory. For very large
     results, set ``output_csv`` and ``return_dataframe=False`` to stream compact
-    rows to disk with bounded memory. The output CSV is overwritten.
+    rows to disk with bounded memory. A full pull overwrites the output CSV. An
+    incremental pull safely chunk-merges into an existing output CSV.
     ``qualification_log_every_pages`` controls how often per-page Sports
     qualification counts are printed; set it to 1 for every API page.
     """
@@ -661,9 +721,25 @@ def pull_sports_markets(
     if qualification_log_every_pages <= 0:
         raise ValueError("qualification_log_every_pages must be positive")
     output_path = Path(output_csv) if output_csv is not None else None
+    csv_write_path = output_path
+    merge_existing_csv = False
     if output_path is not None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        pd.DataFrame(columns=MARKET_COLUMNS).to_csv(output_path, index=False)
+        merge_existing_csv = refresh_utc is not None and output_path.exists()
+        if merge_existing_csv:
+            descriptor, refresh_name = tempfile.mkstemp(
+                prefix=f".{output_path.stem}-refresh-",
+                suffix=".csv",
+                dir=output_path.parent,
+            )
+            os.close(descriptor)
+            csv_write_path = Path(refresh_name)
+            _progress(
+                verbose,
+                f"Incremental refresh will be merged into existing {output_path}",
+                started,
+            )
+        pd.DataFrame(columns=MARKET_COLUMNS).to_csv(csv_write_path, index=False)
 
     _progress(verbose, f"Streaming markets from {scan_start_utc.isoformat()} and filtering each page", started)
     rows: list[dict[str, Any]] = []
@@ -677,10 +753,10 @@ def pull_sports_markets(
 
     def flush_csv() -> None:
         nonlocal csv_written
-        if output_path is None or not csv_buffer:
+        if csv_write_path is None or not csv_buffer:
             return
         pd.DataFrame.from_records(csv_buffer, columns=MARKET_COLUMNS).to_csv(
-            output_path,
+            csv_write_path,
             mode="a",
             header=False,
             index=False,
@@ -786,8 +862,21 @@ def pull_sports_markets(
                     csv_buffer.append(row)
                     if len(csv_buffer) >= csv_flush_rows:
                         flush_csv()
-                        _progress(verbose, f"Streamed {qualifying_count:,} qualifying markets to {output_path}", started)
+                        _progress(verbose, f"Streamed {qualifying_count:,} qualifying markets to {csv_write_path}", started)
     flush_csv()
+    if merge_existing_csv and output_path is not None and csv_write_path is not None:
+        _progress(verbose, f"Merging incremental rows into {output_path}", started)
+        retained_rows, refresh_rows, total_rows = _merge_market_refresh_csv(
+            output_path,
+            csv_write_path,
+            chunksize=csv_flush_rows,
+        )
+        _progress(
+            verbose,
+            f"CSV refresh merged: retained={retained_rows:,}, refreshed={refresh_rows:,}, "
+            f"total={total_rows:,}",
+            started,
+        )
     if not return_dataframe:
         _progress(
             verbose,
