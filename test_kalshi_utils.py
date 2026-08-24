@@ -10,6 +10,7 @@ from kalshi_utils import (
     _ny_day_bounds,
     _parse_datetime,
     _sports_series_for_market,
+    fetch_markets_by_tickers,
     fetch_live_result_candidates,
     load_saved_markets,
     merge_market_refresh,
@@ -58,6 +59,34 @@ class CalculationTests(unittest.TestCase):
 
 
 class MetadataTests(unittest.TestCase):
+    def test_combo_leg_lookup_uses_matching_source_first_and_falls_back(self):
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+
+            def get(self, path, params=None):
+                self.calls.append(path)
+                requested = set(params["tickers"].split(","))
+                available = "HISTORICAL-LEG" if path == "historical/markets" else "LIVE-LEG"
+                return {"markets": [{"ticker": available}] if available in requested else []}
+
+        historical_first = FakeClient()
+        found = fetch_markets_by_tickers(
+            historical_first,
+            ["HISTORICAL-LEG", "LIVE-LEG"],
+            prefer_historical=True,
+        )
+        self.assertEqual(historical_first.calls, ["historical/markets", "markets"])
+        self.assertEqual(set(found), {"HISTORICAL-LEG", "LIVE-LEG"})
+
+        live_first = FakeClient()
+        found = fetch_markets_by_tickers(
+            live_first,
+            ["HISTORICAL-LEG", "LIVE-LEG"],
+        )
+        self.assertEqual(live_first.calls, ["markets", "historical/markets"])
+        self.assertEqual(set(found), {"HISTORICAL-LEG", "LIVE-LEG"})
+
     def test_longest_lexicographic_series_match(self):
         matcher = _SportsSeriesMatcher.build(["KXMLB", "KXMLBGAME", "KXNFLGAME"])
         self.assertEqual(matcher.match("KXMLBGAME-26AUG22NYYBOS"), "KXMLBGAME")

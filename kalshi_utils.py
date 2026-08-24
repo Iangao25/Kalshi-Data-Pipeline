@@ -342,27 +342,43 @@ def fetch_markets_by_tickers(
     tickers: Iterable[str],
     *,
     verbose: bool = False,
+    prefer_historical: bool = False,
 ) -> dict[str, dict[str, Any]]:
-    """Fetch ticker metadata from live first, then query archive for misses."""
+    """Fetch ticker metadata from the preferred source, then query the other for misses."""
 
     found: dict[str, dict[str, Any]] = {}
     requested = list(dict.fromkeys(str(t) for t in tickers if t))
-    live_batches = list(_ticker_batches(requested))
-    _progress(verbose, f"Resolving {len(requested):,} unique combo-leg markets in {len(live_batches):,} live batches")
-    for batch_number, batch in enumerate(live_batches, start=1):
-        payload = client.get("markets", {"tickers": ",".join(batch), "limit": 1000})
-        found.update({market["ticker"]: market for market in payload.get("markets", [])})
-        if batch_number == 1 or batch_number % 10 == 0 or batch_number == len(live_batches):
-            _progress(verbose, f"Combo legs, live batch {batch_number:,}/{len(live_batches):,}: {len(found):,} found")
-    missing = [ticker for ticker in requested if ticker not in found]
-    historical_batches = list(_ticker_batches(missing))
-    if historical_batches:
-        _progress(verbose, f"Checking archive for {len(missing):,} combo legs missing from live data")
-    for batch_number, batch in enumerate(historical_batches, start=1):
-        payload = client.get("historical/markets", {"tickers": ",".join(batch), "limit": 1000})
-        found.update({market["ticker"]: market for market in payload.get("markets", [])})
-        if batch_number == 1 or batch_number % 10 == 0 or batch_number == len(historical_batches):
-            _progress(verbose, f"Combo legs, archive batch {batch_number:,}/{len(historical_batches):,}: {len(found):,} total found")
+    sources = (
+        (("archive", "historical/markets"), ("live", "markets"))
+        if prefer_historical
+        else (("live", "markets"), ("archive", "historical/markets"))
+    )
+    for source_number, (source_name, endpoint) in enumerate(sources, start=1):
+        missing = [ticker for ticker in requested if ticker not in found]
+        if not missing:
+            break
+        batches = list(_ticker_batches(missing))
+        if source_number == 1:
+            _progress(
+                verbose,
+                f"Resolving {len(requested):,} unique combo-leg markets from {source_name} first "
+                f"in {len(batches):,} batches",
+            )
+        else:
+            _progress(
+                verbose,
+                f"Checking {source_name} for {len(missing):,} combo legs missing from "
+                f"{sources[0][0]} data",
+            )
+        for batch_number, batch in enumerate(batches, start=1):
+            payload = client.get(endpoint, {"tickers": ",".join(batch), "limit": 1000})
+            found.update({market["ticker"]: market for market in payload.get("markets", [])})
+            if batch_number == 1 or batch_number % 10 == 0 or batch_number == len(batches):
+                _progress(
+                    verbose,
+                    f"Combo legs, {source_name} batch {batch_number:,}/{len(batches):,}: "
+                    f"{len(found):,} total found",
+                )
     return found
 
 
@@ -415,6 +431,7 @@ def _resolve_occurrences(
     *,
     verbose: bool = False,
     occurrence_cache: dict[str, str | None] | None = None,
+    prefer_historical: bool = False,
 ) -> None:
     occurrence_cache = occurrence_cache if occurrence_cache is not None else {}
     missing_combo = [
@@ -429,7 +446,16 @@ def _resolve_occurrences(
         if leg.get("market_ticker") not in occurrence_cache
     ]
     _progress(verbose, f"Markets needing combo-leg occurrence fallback: {len(missing_combo):,}")
-    legs = fetch_markets_by_tickers(client, leg_tickers, verbose=verbose) if leg_tickers else {}
+    legs = (
+        fetch_markets_by_tickers(
+            client,
+            leg_tickers,
+            verbose=verbose,
+            prefer_historical=prefer_historical,
+        )
+        if leg_tickers
+        else {}
+    )
     for ticker in set(ticker for ticker in leg_tickers if ticker):
         occurrence_cache[ticker] = legs.get(ticker, {}).get("occurrence_datetime")
     for market in markets:
@@ -663,20 +689,26 @@ def pull_sports_markets(
         csv_written = True
 
     page_streams = (
-        _iter_historical_market_pages_since(
-            client,
-            scan_start_utc,
-            early_stop=archive_early_stop,
-            verbose=verbose,
+        (
+            _iter_historical_market_pages_since(
+                client,
+                scan_start_utc,
+                early_stop=archive_early_stop,
+                verbose=verbose,
+            ),
+            True,
         ),
-        _iter_live_market_pages(
-            client,
-            start_utc,
-            refresh_since=refresh_utc,
-            verbose=verbose,
+        (
+            _iter_live_market_pages(
+                client,
+                start_utc,
+                refresh_since=refresh_utc,
+                verbose=verbose,
+            ),
+            False,
         ),
     )
-    for page_stream in page_streams:
+    for page_stream, prefer_historical_legs in page_streams:
         for page in page_stream:
             pages_processed += 1
             candidates: list[dict[str, Any]] = []
@@ -722,6 +754,7 @@ def pull_sports_markets(
                 client,
                 verbose=False,
                 occurrence_cache=leg_occurrence_cache,
+                prefer_historical=prefer_historical_legs,
             )
             for market in candidates:
                 occurrence = _optional_datetime(market.get("occurrence_datetime"))

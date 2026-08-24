@@ -28,6 +28,9 @@ Sports markets and public trades. It uses only unauthenticated public endpoints.
   and, by default, stops after settlement dates pass the requested start. Set
   `archive_early_stop=False` for an exhaustive archive scan if Kalshi changes
   that observed ordering.
+- Combo-leg occurrence lookup is source-aware. Archived combo pages query
+  historical leg markets first, while live pages query live leg markets first;
+  missing legs automatically fall back to the other endpoint.
 - Trade requests use page size 1,000, skip zero-volume markets, run concurrently,
   and automatically query the live endpoint, historical endpoint, or both when
   a market spans the current trade cutoff.
