@@ -14,6 +14,7 @@ from kalshi_utils import (
     _sports_series_for_market,
     fetch_markets_by_tickers,
     fetch_live_result_candidates,
+    daily_market_summary,
     load_saved_markets,
     merge_market_refresh,
     pull_sports_markets,
@@ -61,6 +62,28 @@ class CalculationTests(unittest.TestCase):
 
 
 class MetadataTests(unittest.TestCase):
+    def test_daily_market_summary_breaks_out_single_and_combo_volume(self):
+        markets = pd.DataFrame(
+            [
+                {
+                    "occurrence_date_ny": "2026-08-20",
+                    "ticker": "SINGLE",
+                    "is_combo": False,
+                    "market_volume_contracts": 125.5,
+                },
+                {
+                    "occurrence_date_ny": "2026-08-20",
+                    "ticker": "COMBO",
+                    "is_combo": True,
+                    "market_volume_contracts": 74.5,
+                },
+            ]
+        )
+        row = daily_market_summary(markets).iloc[0]
+        self.assertEqual(row["market_volume_contracts"], 200.0)
+        self.assertEqual(row["single_market_volume_contracts"], 125.5)
+        self.assertEqual(row["combo_market_volume_contracts"], 74.5)
+
     def test_combo_leg_lookup_uses_matching_source_first_and_falls_back(self):
         class FakeClient:
             def __init__(self):

@@ -1194,16 +1194,34 @@ def daily_market_summary(markets: pd.DataFrame) -> pd.DataFrame:
 
     if markets.empty:
         return pd.DataFrame(
-            columns=["occurrence_date_ny", "market_count", "single_market_count", "combo_market_count", "market_volume_contracts"]
+            columns=[
+                "occurrence_date_ny",
+                "market_count",
+                "single_market_count",
+                "combo_market_count",
+                "market_volume_contracts",
+                "single_market_volume_contracts",
+                "combo_market_volume_contracts",
+            ]
         )
     return (
-        markets.assign(single_market=~markets["is_combo"])
+        markets.assign(
+            single_market=~markets["is_combo"],
+            single_market_volume_contracts=markets["market_volume_contracts"].where(
+                ~markets["is_combo"], 0
+            ),
+            combo_market_volume_contracts=markets["market_volume_contracts"].where(
+                markets["is_combo"], 0
+            ),
+        )
         .groupby("occurrence_date_ny", as_index=False)
         .agg(
             market_count=("ticker", "size"),
             single_market_count=("single_market", "sum"),
             combo_market_count=("is_combo", "sum"),
             market_volume_contracts=("market_volume_contracts", "sum"),
+            single_market_volume_contracts=("single_market_volume_contracts", "sum"),
+            combo_market_volume_contracts=("combo_market_volume_contracts", "sum"),
         )
         .sort_values("occurrence_date_ny")
         .reset_index(drop=True)
